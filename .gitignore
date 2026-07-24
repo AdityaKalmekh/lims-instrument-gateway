@@ -1,0 +1,8 @@
+node_modules/
+spool/
+.env
+# node-windows service wrapper artifacts (generated on install)
+daemon/
+*.wrapper.log
+*.out.log
+*.err.log

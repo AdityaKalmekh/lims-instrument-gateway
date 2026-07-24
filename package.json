@@ -1,0 +1,21 @@
+{
+  "name": "lims-instrument-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone on-prem gateway that receives HL7 (MLLP/TCP) result messages from lab analyzers (e.g. Erba H-360 hematology) and forwards normalized results to the LIMS app over HTTP.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "simulate": "node simulator.js",
+    "service:install": "node service/install-service.js",
+    "service:uninstall": "node service/uninstall-service.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-windows": "^1.0.0-beta.8",
+    "pino": "^9.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
