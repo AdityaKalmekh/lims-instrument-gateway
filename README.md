@@ -21,6 +21,10 @@ browsers and never queries the analyzer — it only receives, ACKs, and forwards
 > (`instrumentResultsPayloadSchema`). If that payload shape changes, update it in
 > both repos.
 
+> 📋 **Setting up a physical Erba H-360?** Follow the full, phase-by-phase guide in
+> **[H360-SETUP.md](./H360-SETUP.md)** — cloud prerequisites, installing on the lab
+> PC, connecting the analyzer, code mapping, and running as a service.
+
 ## Run
 
 ```bash
