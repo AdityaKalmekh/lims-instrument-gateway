@@ -76,6 +76,10 @@ const INSTRUMENT_ID = process.env.INSTRUMENT_ID || 'erba-h360'
 // Where in the HL7 message the sample barcode lives. Default OBR-3 (filler
 // order number); override once the real machine's dump is confirmed.
 const BARCODE_LOCATION = process.env.HL7_BARCODE_LOCATION || 'OBR-3'
+// Which OBX-3 component holds the analyte code (code^name^system). Default 1;
+// set to 2 for analyzers that put a LOINC/local code in component 1 and the
+// readable mnemonic (WBC, HGB, ...) in component 2 (e.g. the Erba H-360).
+const CODE_COMPONENT = Number(process.env.HL7_CODE_COMPONENT || 1)
 // How many times to retry the POST to the app before spooling to disk.
 const FORWARD_ATTEMPTS = Number(process.env.FORWARD_ATTEMPTS || 3)
 const FORWARD_TIMEOUT_MS = Number(process.env.FORWARD_TIMEOUT_MS || 10000)
@@ -166,7 +170,10 @@ async function handleMessage(raw, socket) {
     return
   }
 
-  const extracted = extractResults(parsed, { barcodeLocation: BARCODE_LOCATION })
+  const extracted = extractResults(parsed, {
+    barcodeLocation: BARCODE_LOCATION,
+    codeComponent: CODE_COMPONENT,
+  })
 
   // ACK immediately — analyzers expect a prompt reply and may stall without it.
   try {
@@ -231,7 +238,27 @@ const tcpServer = net.createServer((socket) => {
     )
   })
 
-  socket.on('data', (chunk) => push(chunk))
+  socket.on('data', (chunk) => {
+    // Diagnostic raw capture: record exactly what the analyzer sends, before any
+    // parsing, so an unfamiliar framing (ASTM vs HL7/MLLP) can be identified.
+    // Enable by setting CAPTURE_RAW=1; writes to spool/raw-capture.log.
+    if (process.env.CAPTURE_RAW === '1') {
+      try {
+        fs.mkdirSync(SPOOL_DIR, { recursive: true })
+        const printable = chunk
+          .toString('utf8')
+          .replace(/[\x00-\x1f]/g, (c) => `<${c.charCodeAt(0)}>`)
+        fs.appendFileSync(
+          path.join(SPOOL_DIR, 'raw-capture.log'),
+          `\n[${new Date().toISOString()}] ${peer} ${chunk.length} bytes\n` +
+            `HEX: ${chunk.toString('hex')}\nTXT: ${printable}\n`
+        )
+      } catch (err) {
+        logger.warn({ err: err.message }, 'raw capture failed')
+      }
+    }
+    push(chunk)
+  })
   socket.on('error', (err) => logger.warn({ peer, err: err.message }, 'Socket error'))
   socket.on('close', () => logger.info({ peer }, 'Analyzer disconnected'))
 })
