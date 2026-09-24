@@ -1,0 +1,54 @@
+# systemd unit for the LIMS instrument gateway on the droplet.
+#
+# Install to /etc/systemd/system/lims-instrument-gateway.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lims-instrument-gateway
+#
+# Logs: journalctl -u lims-instrument-gateway -f
+
+[Unit]
+Description=LIMS instrument gateway (HL7/MLLP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=instgateway
+Group=instgateway
+WorkingDirectory=/opt/lims-instrument-gateway
+
+# Config lives here, not in the unit file. chmod 600, owned by root.
+# Real environment variables win over the repo's .env loader, so no .env is
+# needed next to index.js.
+EnvironmentFile=/etc/lims-instrument-gateway.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node index.js
+
+# Analyzers connect whenever they finish a sample, so the listener must always
+# be up. Never let the default start-rate limit park the unit in a failed state.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# Undeliverable messages and the CAPTURE_RAW log are written here.
+ReadWritePaths=/opt/lims-instrument-gateway/spool
+
+# --- Logging ---------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=inst-gateway
+
+[Install]
+WantedBy=multi-user.target
