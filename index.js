@@ -212,6 +212,14 @@ async function handleMessage(raw, socket, port) {
     logger.warn({ err: err.message }, 'Failed to write ACK')
   }
 
+  // Only result messages carry results. Some analyzers also send status
+  // messages (the Cellomax sends SSU^U03 before every result); they are ACKed
+  // above but not forwarded, or they'd clutter the LIMS as empty unmatched rows.
+  if (extracted.messageType && !extracted.messageType.startsWith('ORU')) {
+    logger.info({ port, type: extracted.messageType }, 'Skipped non-result message')
+    return
+  }
+
   if (!extracted.barcode) {
     logger.warn(
       { port, location: config.barcodeLocation },
