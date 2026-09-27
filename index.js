@@ -86,6 +86,18 @@ const FORWARD_TIMEOUT_MS = Number(process.env.FORWARD_TIMEOUT_MS || 10000)
 // Messages that can't be delivered are written here so nothing is ever lost.
 const SPOOL_DIR = path.join(__dirname, 'spool')
 
+// Central mode (the droplet): one gateway serves every lab. Each lab's analyzer
+// has its own port, assigned in the LIMS ("Connect analyzer"); the gateway polls
+// the app for the port list and each port's parse settings, and sends the port
+// with every result so the app knows the lab. Off by default so an on-prem
+// gateway in a single lab behaves exactly as before.
+const CENTRAL_MODE = process.env.CENTRAL_MODE === '1'
+const CONNECTIONS_URL =
+  process.env.CONNECTIONS_URL || APP_INGEST_URL.replace(/\/results\/?$/, '/connections')
+const CONNECTIONS_POLL_MS = Number(process.env.CONNECTIONS_POLL_MS || 60000)
+// Keep idle analyzer connections alive through ISP/NAT idle timeouts.
+const KEEPALIVE_MS = Number(process.env.TCP_KEEPALIVE_MS || 60000)
+
 const logger = pino({ level: process.env.INSTRUMENT_GATEWAY_LOG_LEVEL || 'info' })
 
 // --- Forwarding to the app --------------------------------------------------
@@ -153,8 +165,26 @@ function spool(raw, payload) {
 
 // --- TCP / MLLP server ------------------------------------------------------
 
+// --- Per-port config ----------------------------------------------------------
+
+/** Parse settings for the legacy/single port, from env (on-prem behaviour). */
+const envConfig = {
+  instrumentId: INSTRUMENT_ID,
+  barcodeLocation: BARCODE_LOCATION,
+  codeComponent: CODE_COMPONENT,
+}
+
+/** port -> { instrumentId, barcodeLocation, codeComponent } from the app. */
+let connectionsByPort = new Map()
+
+/** Settings for a message that arrived on `port`. */
+function configForPort(port) {
+  return connectionsByPort.get(port) || envConfig
+}
+
 /** Handles one complete HL7 message: parse, ACK, forward. */
-async function handleMessage(raw, socket) {
+async function handleMessage(raw, socket, port) {
+  const config = configForPort(port)
   let parsed
   try {
     parsed = parse(raw)
@@ -171,8 +201,8 @@ async function handleMessage(raw, socket) {
   }
 
   const extracted = extractResults(parsed, {
-    barcodeLocation: BARCODE_LOCATION,
-    codeComponent: CODE_COMPONENT,
+    barcodeLocation: config.barcodeLocation,
+    codeComponent: config.codeComponent,
   })
 
   // ACK immediately — analyzers expect a prompt reply and may stall without it.
@@ -184,19 +214,20 @@ async function handleMessage(raw, socket) {
 
   if (!extracted.barcode) {
     logger.warn(
-      { location: BARCODE_LOCATION },
+      { port, location: config.barcodeLocation },
       'No barcode found in message; forwarding anyway for the app to log'
     )
   }
   if (extracted.barcodeSource.usedFallback) {
     logger.warn(
-      { used: extracted.barcodeSource.location, configured: BARCODE_LOCATION },
-      'Barcode found via fallback location — consider updating HL7_BARCODE_LOCATION'
+      { port, used: extracted.barcodeSource.location, configured: config.barcodeLocation },
+      'Barcode found via fallback location — check the analyzer model settings'
     )
   }
 
   const payload = {
-    instrumentId: INSTRUMENT_ID,
+    instrumentId: config.instrumentId,
+    port,
     receivedAt: new Date().toISOString(),
     messageType: extracted.messageType,
     controlId: extracted.controlId,
@@ -207,7 +238,7 @@ async function handleMessage(raw, socket) {
   }
 
   logger.info(
-    { barcode: payload.barcode, type: payload.messageType, results: payload.results.length },
+    { port, barcode: payload.barcode, type: payload.messageType, results: payload.results.length },
     'Message received'
   )
 
@@ -228,12 +259,16 @@ function buildErrorAck(raw, message) {
   )
 }
 
-const tcpServer = net.createServer((socket) => {
+/** Handles one analyzer TCP connection on `port`. */
+function onAnalyzerConnection(socket, port) {
   const peer = `${socket.remoteAddress}:${socket.remotePort}`
-  logger.info({ peer }, 'Analyzer connected')
+  logger.info({ port, peer }, 'Analyzer connected')
+  // Analyzers hold one connection open for hours between samples; without
+  // keep-alive probes an ISP's NAT drops it silently and the next result is lost.
+  socket.setKeepAlive(true, KEEPALIVE_MS)
 
   const push = createMllpParser((message) => {
-    handleMessage(message, socket).catch((err) =>
+    handleMessage(message, socket, port).catch((err) =>
       logger.error({ err: err.message }, 'Unhandled error handling message')
     )
   })
@@ -259,25 +294,106 @@ const tcpServer = net.createServer((socket) => {
     }
     push(chunk)
   })
-  socket.on('error', (err) => logger.warn({ peer, err: err.message }, 'Socket error'))
-  socket.on('close', () => logger.info({ peer }, 'Analyzer disconnected'))
-})
+  socket.on('error', (err) => logger.warn({ port, peer, err: err.message }, 'Socket error'))
+  socket.on('close', () => logger.info({ port, peer }, 'Analyzer disconnected'))
+}
+
+// --- Listeners ----------------------------------------------------------------
+
+/** port -> { server, sockets:Set } for every port we listen on. */
+const listeners = new Map()
+
+function openPort(port) {
+  if (listeners.has(port)) return
+  const sockets = new Set()
+  const server = net.createServer((socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    onAnalyzerConnection(socket, port)
+  })
+  server.on('error', (err) => {
+    logger.error({ port, err: err.message }, 'Listener error')
+    listeners.delete(port)
+  })
+  server.listen(port, () => logger.info({ port }, `Listening for HL7/MLLP on :${port}`))
+  listeners.set(port, { server, sockets })
+}
+
+/** Stops listening on a port and drops its analyzers (connection paused/removed). */
+function closePort(port) {
+  const entry = listeners.get(port)
+  if (!entry) return
+  entry.server.close()
+  for (const socket of entry.sockets) socket.destroy()
+  listeners.delete(port)
+  logger.info({ port }, 'Stopped listening (connection no longer active)')
+}
+
+/**
+ * Central mode: fetch the active connections from the app and make the open
+ * ports match. The env port (TCP_PORT) always stays open so an analyzer that
+ * hasn't been given its own port yet keeps working. On a failed fetch nothing
+ * changes — a LIMS outage must never close a lab's port.
+ */
+async function syncConnections() {
+  let body
+  try {
+    const res = await fetch(CONNECTIONS_URL, {
+      headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
+    })
+    if (!res.ok) {
+      logger.warn({ status: res.status }, 'Could not fetch connections; keeping current ports')
+      return
+    }
+    body = await res.json()
+  } catch (err) {
+    logger.warn({ err: err.message }, 'Could not fetch connections; keeping current ports')
+    return
+  }
+
+  const next = new Map()
+  for (const c of body.connections || []) {
+    if (!Number.isInteger(c.port)) continue
+    next.set(c.port, {
+      instrumentId: c.instrumentId,
+      barcodeLocation: c.barcodeLocation,
+      codeComponent: c.codeComponent,
+    })
+  }
+  connectionsByPort = next
+
+  for (const port of next.keys()) openPort(port)
+  for (const port of Array.from(listeners.keys())) {
+    if (port !== TCP_PORT && !next.has(port)) closePort(port)
+  }
+}
 
 // --- HTTP health server -----------------------------------------------------
 
 const app = express()
 app.get('/health', (_req, res) =>
-  res.json({ ok: true, instrumentId: INSTRUMENT_ID, tcpPort: TCP_PORT })
+  res.json({
+    ok: true,
+    centralMode: CENTRAL_MODE,
+    instrumentId: INSTRUMENT_ID,
+    tcpPort: TCP_PORT,
+    ports: Array.from(listeners.keys()).sort((a, b) => a - b),
+  })
 )
 
 // --- Start ------------------------------------------------------------------
 
-tcpServer.listen(TCP_PORT, () => {
-  logger.info(
-    { tcpPort: TCP_PORT, ingest: APP_INGEST_URL, instrumentId: INSTRUMENT_ID },
-    `Instrument gateway listening for HL7/MLLP on :${TCP_PORT}`
-  )
-})
+logger.info(
+  { tcpPort: TCP_PORT, ingest: APP_INGEST_URL, centralMode: CENTRAL_MODE },
+  'Instrument gateway starting'
+)
+openPort(TCP_PORT)
+
+if (CENTRAL_MODE) {
+  void syncConnections()
+  setInterval(() => void syncConnections(), CONNECTIONS_POLL_MS)
+}
 
 app.listen(HTTP_PORT, () => {
   logger.info(`Health endpoint on http://localhost:${HTTP_PORT}/health`)

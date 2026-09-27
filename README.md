@@ -21,7 +21,18 @@ browsers and never queries the analyzer — it only receives, ACKs, and forwards
 > (`instrumentResultsPayloadSchema`). If that payload shape changes, update it in
 > both repos.
 
-> 📋 **Setting up a physical Erba H-360?** Follow the full, phase-by-phase guide in
+> 🌐 **Central mode (production).** One gateway on the DigitalOcean droplet
+> serves every lab — no PC in the lab. Each lab's analyzer connects over the
+> internet to the droplet's Reserved IP on **its own port**, assigned in the LIMS
+> (Instrument Mappings → *Connect analyzer*). With `CENTRAL_MODE=1` the gateway
+> polls `/api/instruments/connections` every minute, opens/closes ports to match,
+> parses each port with its analyzer model's settings, and sends the port with
+> every result so the LIMS knows the lab. Config: `deploy/instrument-gateway.env.example`;
+> service: `deploy/lims-instrument-gateway.service`. Firewall: `ufw allow 5150:5199/tcp`.
+> Analyzer LIS settings: droplet IP + assigned port, **Communication
+> Acknowledgement off** (the H-360 doesn't accept our ACK format yet).
+
+> 📋 **Setting up a physical Erba H-360 on a lab PC (on-prem mode)?** Follow the full, phase-by-phase guide in
 > **[H360-SETUP.md](./H360-SETUP.md)** — cloud prerequisites, installing on the lab
 > PC, connecting the analyzer, code mapping, and running as a service.
 
