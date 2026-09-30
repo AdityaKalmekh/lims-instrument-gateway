@@ -29,7 +29,7 @@ const express = require('express')
 const pino = require('pino')
 
 const { createMllpParser, frame } = require('./lib/mllp')
-const { parse, extractResults, buildAck } = require('./lib/hl7')
+const { parse, extractResults, buildAck, stripImages } = require('./lib/hl7')
 
 // Load config from a local .env file next to this script (if present) so the
 // gateway behaves identically whether launched from a terminal or the Windows
@@ -242,7 +242,9 @@ async function handleMessage(raw, socket, port) {
     barcode: extracted.barcode || null,
     patient: extracted.patient,
     results: extracted.results,
-    raw,
+    // Bitmap images are dropped from the stored copy (they alone can exceed the
+    // LIMS's size limit); the spool below still keeps the message as received.
+    raw: stripImages(raw),
   }
 
   logger.info(
@@ -285,7 +287,9 @@ function onAnalyzerConnection(socket, port) {
     // Diagnostic raw capture: record exactly what the analyzer sends, before any
     // parsing, so an unfamiliar framing (ASTM vs HL7/MLLP) can be identified.
     // Enable by setting CAPTURE_RAW=1; writes to spool/raw-capture.log.
-    if (process.env.CAPTURE_RAW === '1') {
+    // Single bytes are skipped: the Mindray BC-5150 sends a 1-byte heartbeat
+    // every 3 seconds, which would otherwise flood the capture log.
+    if (process.env.CAPTURE_RAW === '1' && chunk.length > 1) {
       try {
         fs.mkdirSync(SPOOL_DIR, { recursive: true })
         const printable = chunk
