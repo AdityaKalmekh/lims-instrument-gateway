@@ -8,7 +8,10 @@
     "start": "node index.js",
     "simulate": "node simulator.js",
     "service:install": "node service/install-service.js",
-    "service:uninstall": "node service/uninstall-service.js"
+    "service:uninstall": "node service/uninstall-service.js",
+    "relay": "node relay.js",
+    "relay:install": "node service/install-relay.js",
+    "relay:uninstall": "node service/uninstall-relay.js"
   },
   "dependencies": {
     "express": "^4.21.2",

@@ -32,6 +32,16 @@ browsers and never queries the analyzer — it only receives, ACKs, and forwards
 > Analyzer LIS settings: droplet IP + assigned port, **Communication
 > Acknowledgement off** (the H-360 doesn't accept our ACK format yet).
 
+> 🔁 **Analyzer relay (`relay.js`) — for analyzers that wait to be connected to.**
+> The Mindray BC-5150 has no LIS address setting: it listens on the lab network
+> (port 5100) and waits for the LIS to connect. The droplet can't reach into a
+> lab, so a lab PC runs the relay, which connects to the analyzer locally and to
+> the gateway's port for that lab, and pipes bytes both ways. It parses nothing.
+> On the lab PC: install Node.js, download this repo, `npm install`,
+> `copy relay.env.example relay.env` and set `ANALYZER_HOST` + `GATEWAY_PORT`,
+> test with `npm run relay`, then `npm run relay:install` (Administrator) to run
+> it as the **LIMS Analyzer Relay** service on every boot.
+
 > 📋 **Setting up a physical Erba H-360 on a lab PC (on-prem mode)?** Follow the full, phase-by-phase guide in
 > **[H360-SETUP.md](./H360-SETUP.md)** — cloud prerequisites, installing on the lab
 > PC, connecting the analyzer, code mapping, and running as a service.

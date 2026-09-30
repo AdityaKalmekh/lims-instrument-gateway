@@ -6,3 +6,4 @@ daemon/
 *.wrapper.log
 *.out.log
 *.err.log
+relay.env
