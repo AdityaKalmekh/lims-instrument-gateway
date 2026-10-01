@@ -57,6 +57,14 @@ const ANALYZER_PORT = Number(process.env.ANALYZER_PORT || 5100)
 const GATEWAY_HOST = process.env.GATEWAY_HOST || '209.38.124.112'
 const GATEWAY_PORT = Number(process.env.GATEWAY_PORT)
 
+// Share mode: also serve the analyzer's results to the lab's existing software
+// (e.g. Pathosys), which connects HERE instead of to the analyzer — the
+// analyzer accepts only one connection. Unset = relay to the gateway only.
+const SHARE_PORT = process.env.SHARE_PORT ? Number(process.env.SHARE_PORT) : null
+const SHARE_HOST = process.env.SHARE_HOST || '0.0.0.0'
+// Bytes held for the gateway while it is unreachable in share mode.
+const MAX_PENDING_BYTES = 5 * 1024 * 1024
+
 const RETRY_MS = Number(process.env.RELAY_RETRY_MS || 5000)
 const CONNECT_TIMEOUT_MS = Number(process.env.RELAY_CONNECT_TIMEOUT_MS || 10000)
 // Keep-alive probes so a link an ISP's NAT dropped silently is noticed and redialled.
@@ -131,7 +139,133 @@ async function session() {
   })
 }
 
+/**
+ * Share mode. The analyzer link is kept up on its own (the lab's existing
+ * software must keep receiving even when the internet is down), and every
+ * byte from the analyzer goes to both the gateway and the connected share
+ * clients. The existing software stays the analyzer's conversation partner:
+ * its replies reach the analyzer, while the gateway's ACKs are dropped so the
+ * analyzer never hears two answers. While the gateway is unreachable its copy
+ * is held in memory (up to 5 MB) and sent on reconnect.
+ */
+function shareMode() {
+  const clients = new Set()
+  let analyzer = null
+  let gateway = null
+  let pending = []
+  let pendingBytes = 0
+
+  const toGateway = (chunk) => {
+    if (gateway) {
+      gateway.write(chunk)
+      return
+    }
+    pendingBytes += chunk.length
+    if (pendingBytes > MAX_PENDING_BYTES) {
+      log('Gateway unreachable for too long; dropping held results (re-send them from the analyzer).')
+      pending = []
+      pendingBytes = 0
+      return
+    }
+    pending.push(chunk)
+  }
+
+  // Analyzer link — redialled forever, independent of the gateway.
+  const dialAnalyzer = async () => {
+    try {
+      analyzer = await connect(ANALYZER_HOST, ANALYZER_PORT, 'analyzer')
+    } catch (err) {
+      log(`Cannot connect: ${err.message}. Retrying every ${RETRY_MS / 1000}s…`)
+      setTimeout(dialAnalyzer, RETRY_MS)
+      return
+    }
+    log(`Connected to analyzer ${ANALYZER_HOST}:${ANALYZER_PORT}`)
+    analyzer.on('data', (chunk) => {
+      for (const client of clients) client.write(chunk)
+      toGateway(chunk)
+    })
+    const lost = (why) => {
+      if (!analyzer) return
+      analyzer.destroy()
+      analyzer = null
+      log(`Analyzer link lost (${why}); redialling in ${RETRY_MS / 1000}s`)
+      setTimeout(dialAnalyzer, RETRY_MS)
+    }
+    analyzer.on('close', () => lost('closed by the analyzer'))
+    analyzer.on('error', (err) => lost(err.message))
+  }
+
+  // Gateway link — redialled forever; what it sends back is dropped.
+  let lastGatewayError = ''
+  const dialGateway = async () => {
+    try {
+      gateway = await connect(GATEWAY_HOST, GATEWAY_PORT, 'gateway')
+    } catch (err) {
+      if (err.message !== lastGatewayError) {
+        log(`Cannot connect: ${err.message}. Retrying every ${RETRY_MS / 1000}s…`)
+        lastGatewayError = err.message
+      }
+      setTimeout(dialGateway, RETRY_MS)
+      return
+    }
+    lastGatewayError = ''
+    log(`Connected to gateway ${GATEWAY_HOST}:${GATEWAY_PORT}`)
+    if (pending.length > 0) {
+      log(`Sending ${pendingBytes} bytes held while the gateway was unreachable`)
+      for (const chunk of pending) gateway.write(chunk)
+      pending = []
+      pendingBytes = 0
+    }
+    gateway.on('data', () => {})
+    const lost = (why) => {
+      if (!gateway) return
+      gateway.destroy()
+      gateway = null
+      log(`Gateway link lost (${why}); holding results and redialling in ${RETRY_MS / 1000}s`)
+      setTimeout(dialGateway, RETRY_MS)
+    }
+    gateway.on('close', () => lost('closed'))
+    gateway.on('error', (err) => lost(err.message))
+  }
+
+  // The existing software connects here as if this PC were the analyzer.
+  const server = net.createServer((client) => {
+    const peer = `${client.remoteAddress}:${client.remotePort}`
+    client.setKeepAlive(true, KEEPALIVE_MS)
+    client.setNoDelay(true)
+    clients.add(client)
+    log(`Existing software connected (${peer}); sharing results with it`)
+    client.on('data', (chunk) => {
+      if (analyzer) analyzer.write(chunk)
+    })
+    const gone = () => {
+      if (!clients.delete(client)) return
+      log(`Existing software disconnected (${peer})`)
+    }
+    client.on('close', gone)
+    client.on('error', gone)
+  })
+  server.on('error', (err) => {
+    log(`Cannot listen on ${SHARE_HOST}:${SHARE_PORT} for the existing software: ${err.message}`)
+    process.exit(1)
+  })
+  server.listen(SHARE_PORT, SHARE_HOST, () =>
+    log(`Sharing results: existing software can connect to this PC on port ${SHARE_PORT}`)
+  )
+
+  void dialGateway()
+  void dialAnalyzer()
+}
+
 async function main() {
+  if (SHARE_PORT) {
+    log(
+      `LIMS analyzer relay starting (share mode): analyzer ${ANALYZER_HOST}:${ANALYZER_PORT}, ` +
+        `gateway ${GATEWAY_HOST}:${GATEWAY_PORT}, existing software on port ${SHARE_PORT}`
+    )
+    shareMode()
+    return
+  }
   log(
     `LIMS analyzer relay starting: analyzer ${ANALYZER_HOST}:${ANALYZER_PORT}, gateway ${GATEWAY_HOST}:${GATEWAY_PORT}`
   )
